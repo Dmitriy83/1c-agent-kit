@@ -1,0 +1,787 @@
+"""
+Локальная транскрипция аудио/видео через faster-whisper (CUDA) + опц. диаризация (pyannote).
+
+Архитектура: orchestrator + 2 subprocess (изоляция CUDA-DLL ctranslate2 vs torch).
+При --diarize транскрипция и диаризация запускаются параллельно.
+
+Использование:
+    python transcribe_local.py <input_path> [--output-dir DIR] [--model MODEL]
+                               [--language ru] [--diarize]
+                               [--num-speakers N] [--min-speakers N] [--max-speakers N]
+
+Зависимости:
+    отдельный venv (env WHISPER_PYTHON): faster-whisper, ctranslate2-CUDA, ffmpeg.
+    Для --diarize два движка:
+      pyannote (default без --num-speakers): torch (CUDA), pyannote.audio>=4, HF_TOKEN в env;
+        чекпойнт pyannote/speaker-diarization-community-1, автодетект числа спикеров.
+      sherpa-onnx (default с --num-speakers): venv-sherpa, точное N; его пороговый
+        автодетект пересегментирует (16.07.26: 242 кластера на ~7 человек) - не использовать.
+
+Файлы вывода:
+    <base> - транскрипция.md       Markdown c таймкодами по сегментам (без спикеров)
+    <base> - транскрипция.txt      Plain text
+    <base> - со спикерами.md       MD c [Спикер, MM:SS] (только при --diarize)
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import time
+import traceback
+from pathlib import Path
+
+# Вывод содержит кириллицу. Без явного переключения печать падает с UnicodeEncodeError
+# везде, где консоль не в UTF-8: сборочный агент, чужая локаль.
+sys.stdout.reconfigure(encoding='utf-8')
+sys.stderr.reconfigure(encoding='utf-8')
+
+
+def _setup_cuda_dll_path() -> None:
+    """Добавить bin-директории nvidia.* пакетов в PATH и DLL search (Windows, CUDA 12)."""
+    for name in ("nvidia.cublas", "nvidia.cudnn", "nvidia.cuda_runtime", "nvidia.cuda_nvrtc"):
+        try:
+            mod = __import__(name, fromlist=[""])
+            bin_dir = os.path.join(mod.__path__[0], "bin")
+            if os.path.isdir(bin_dir):
+                if hasattr(os, "add_dll_directory"):
+                    os.add_dll_directory(bin_dir)
+                os.environ["PATH"] = bin_dir + os.pathsep + os.environ.get("PATH", "")
+        except ImportError:
+            pass
+
+
+def _load_dotenv() -> None:
+    """Подгрузить переменные из ~/.claude/skills/transcribe/.env (HF_TOKEN, GEMINI_API_KEY и т.п.)."""
+    env_path = Path(__file__).resolve().parent.parent / ".env"
+    if not env_path.exists():
+        return
+    for line in env_path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+
+def format_ts(seconds: float) -> str:
+    s = int(seconds)
+    return f"{s // 60:02d}:{s % 60:02d}"
+
+
+def _glossary(args):
+    """Глоссарий терминов для этого прогона (пустой, если выключен или не найден).
+
+    Импорт отложенный и защищенный: скрипт запускается в venv распознавателя, и падать из-за
+    вспомогательного модуля он не должен - без глоссария разбор просто идет как раньше.
+    """
+    if getattr(args, "no_glossary", False):
+        return None
+    try:
+        import glossary as gl_mod
+    except ImportError as e:
+        print(f"[T] глоссарий не загружен ({e}) - продолжаю без терминов", file=sys.stderr)
+        return None
+    gl = gl_mod.load(getattr(args, "glossary", None))
+    for w in gl.warnings:
+        print(f"[T] глоссарий: {w}", file=sys.stderr)
+    return gl or None
+
+
+# =====================================================================
+# WORKER: транскрипция (запускается как subprocess)
+# =====================================================================
+
+def worker_transcribe(args) -> int:
+    _setup_cuda_dll_path()
+    from faster_whisper import WhisperModel  # noqa
+
+    print(f"[T] Модель: {args.model} ({args.device}/{args.compute_type})", flush=True)
+    t0 = time.time()
+    model = WhisperModel(args.model, device=args.device, compute_type=args.compute_type)
+    print(f"[T] Модель загружена за {time.time() - t0:.1f}с", flush=True)
+
+    # Глоссарий уходит в hotwords: faster-whisper подмешивает их в промпт КАЖДОГО окна, поэтому
+    # термины подсказываются всю дорогу (initial_prompt влияет в основном на первое окно и дальше
+    # вытесняется предыдущим текстом). Сам список все равно режется сервером по лимиту промпта.
+    gl = _glossary(args)
+    hotwords = gl.hotwords() if gl else None
+    if hotwords:
+        print(f"[T] Термины-подсказки: {hotwords[:120]}{'...' if len(hotwords) > 120 else ''}",
+              flush=True)
+
+    print(f"[T] Транскрипция (word_timestamps={args.need_words})...", flush=True)
+    t0 = time.time()
+    segments_iter, info = model.transcribe(
+        args.input,
+        language=args.language,
+        beam_size=5,
+        vad_filter=True,
+        vad_parameters={"min_silence_duration_ms": 500},
+        condition_on_previous_text=True,
+        word_timestamps=args.need_words,
+        hotwords=hotwords or None,
+    )
+    print(f"[T] Язык: {info.language} (p={info.language_probability:.2f}) длительность {info.duration:.1f}с", flush=True)
+
+    segments: list[dict] = []
+    last_pct = -1
+    for seg in segments_iter:
+        words = []
+        if args.need_words and seg.words:
+            for w in seg.words:
+                words.append({"start": float(w.start), "end": float(w.end), "text": w.word})
+        segments.append({
+            "start": float(seg.start),
+            "end": float(seg.end),
+            "text": seg.text.strip(),
+            "words": words,
+        })
+        pct = int(100 * seg.end / max(info.duration, 1))
+        if pct >= last_pct + 5:
+            last_pct = pct
+            print(f"[T] [{pct:3d}%] {format_ts(seg.start)}: {seg.text.strip()[:80]}", flush=True)
+
+    info_dict = {
+        "language": info.language,
+        "language_probability": float(info.language_probability),
+        "duration": float(info.duration),
+    }
+
+    out = {"segments": segments, "info": info_dict}
+    Path(args.out_json).write_text(json.dumps(out, ensure_ascii=False), encoding="utf-8")
+    print(f"[T] Готово за {time.time() - t0:.1f}с ({len(segments)} сегментов) → {args.out_json}", flush=True)
+    # Обходим segfault в нативном cleanup ctranslate2 на Windows
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(0)
+
+
+# =====================================================================
+# WORKER: диаризация (запускается как subprocess)
+# =====================================================================
+
+def worker_diarize(args) -> int:
+    _setup_cuda_dll_path()
+    _load_dotenv()
+    # Телеметрия pyannote 4.x падает на входах без определимой длительности
+    # (webm: NoneType < int в track_pipeline_apply) - выключаем до импорта
+    os.environ.setdefault("PYANNOTE_METRICS_ENABLED", "false")
+
+    import torch
+    from pyannote.audio import Pipeline
+
+    if args.tf32:
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        try:
+            from pyannote.audio.utils import reproducibility as _reprod
+            if hasattr(_reprod, "fix_reproducibility"):
+                _reprod.fix_reproducibility = lambda *a, **k: None
+            for name in ("disable_tf32", "_disable_tf32"):
+                if hasattr(_reprod, name):
+                    setattr(_reprod, name, lambda *a, **k: None)
+        except Exception:
+            pass
+        print("[D] TF32 включен + monkeypatch reproducibility (быстрее, чуть менее воспроизводимо)", flush=True)
+
+    hf_token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_TOKEN")
+    if not hf_token:
+        print("[D] HF_TOKEN не задан в env", file=sys.stderr)
+        return 2
+
+    print(f"[D] Загрузка pipeline {args.model}...", flush=True)
+    t0 = time.time()
+    pipeline = Pipeline.from_pretrained(args.model, token=hf_token)
+    if torch.cuda.is_available():
+        pipeline.to(torch.device("cuda"))
+        print("[D] pipeline на CUDA", flush=True)
+    else:
+        print("[D] WARN: CUDA недоступна, диаризация на CPU очень медленная", flush=True)
+    print(f"[D] Pipeline загружен за {time.time() - t0:.1f}с", flush=True)
+
+    print("[D] Диаризация...", flush=True)
+    t0 = time.time()
+    kwargs = {}
+    if args.num_speakers is not None:
+        kwargs["num_speakers"] = args.num_speakers
+    if args.min_speakers is not None:
+        kwargs["min_speakers"] = args.min_speakers
+    if args.max_speakers is not None:
+        kwargs["max_speakers"] = args.max_speakers
+
+    with tempfile.TemporaryDirectory() as tmp:
+        # ffmpeg -> 16kHz mono WAV: надежный декод любого контейнера (webm/opus и т.п.)
+        wav_path = Path(tmp) / "audio_16k.wav"
+        subprocess.run(
+            ["ffmpeg", "-y", "-i", str(args.input), "-vn", "-ac", "1", "-ar", "16000",
+             "-acodec", "pcm_s16le", str(wav_path)],
+            check=True, capture_output=True)
+        result = pipeline(str(wav_path), **kwargs)
+
+    annotation = getattr(result, "exclusive_speaker_diarization", None) \
+        or getattr(result, "speaker_diarization", None) \
+        or result
+
+    turns: list[dict] = []
+    for turn, _, speaker in annotation.itertracks(yield_label=True):
+        turns.append({"start": float(turn.start), "end": float(turn.end), "speaker": str(speaker)})
+    turns.sort(key=lambda t: t["start"])
+
+    speakers_set = sorted({t["speaker"] for t in turns})
+    Path(args.out_json).write_text(json.dumps(turns, ensure_ascii=False), encoding="utf-8")
+    print(f"[D] Готово за {time.time() - t0:.1f}с ({len(turns)} turns, {len(speakers_set)} спикеров) → {args.out_json}", flush=True)
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(0)
+
+
+# =====================================================================
+# MERGE / OUTPUT
+# =====================================================================
+
+def assign_speaker(midpoint: float, turns: list[dict]) -> str:
+    for t in turns:
+        if t["start"] <= midpoint <= t["end"]:
+            return t["speaker"]
+    if not turns:
+        return "UNKNOWN"
+    nearest = min(turns, key=lambda t: min(abs(t["start"] - midpoint), abs(t["end"] - midpoint)))
+    return nearest["speaker"]
+
+
+def smooth_word_speakers(words: list[dict], min_run: float = 1.2) -> None:
+    """Сгладить короткие пробивки спикера в словах: если короткий run X между двумя длинными run Y,
+    переаттрибутировать слова run X на спикера Y. Изменяет words на месте.
+    """
+    if not words:
+        return
+    runs: list[tuple[int, int, str, float]] = []
+    i = 0
+    n = len(words)
+    while i < n:
+        j = i
+        spk = words[i]["speaker"]
+        while j + 1 < n and words[j + 1]["speaker"] == spk:
+            j += 1
+        duration = words[j]["end"] - words[i]["start"]
+        runs.append((i, j, spk, duration))
+        i = j + 1
+
+    changed = True
+    while changed:
+        changed = False
+        for k in range(1, len(runs) - 1):
+            ri, rj, rspk, rdur = runs[k]
+            li, lj, lspk, ldur = runs[k - 1]
+            ni, nj, nspk, ndur = runs[k + 1]
+            if rdur < min_run and lspk == nspk and lspk != rspk:
+                for x in range(ri, rj + 1):
+                    words[x]["speaker"] = lspk
+                runs[k - 1] = (li, rj, lspk, words[rj]["end"] - words[li]["start"])
+                runs.pop(k)
+                if k < len(runs):
+                    nri, nrj, nrspk, _ = runs[k]
+                    if nrspk == lspk:
+                        runs[k - 1] = (li, nrj, lspk, words[nrj]["end"] - words[li]["start"])
+                        runs.pop(k)
+                changed = True
+                break
+
+
+def merge_with_speakers(segments: list[dict], turns: list[dict]) -> list[dict]:
+    all_words: list[dict] = []
+    word_segments_no_words: list[dict] = []
+    for seg in segments:
+        words = seg.get("words") or []
+        if not words:
+            mid = (seg["start"] + seg["end"]) / 2
+            spk = assign_speaker(mid, turns)
+            word_segments_no_words.append({
+                "start": seg["start"], "end": seg["end"], "speaker": spk, "text": seg["text"],
+            })
+            continue
+        for w in words:
+            mid = (w["start"] + w["end"]) / 2
+            spk = assign_speaker(mid, turns)
+            all_words.append({"start": w["start"], "end": w["end"], "text": w["text"], "speaker": spk})
+
+    smooth_word_speakers(all_words, min_run=1.2)
+
+    utterances: list[dict] = []
+    current: dict | None = None
+    for w in all_words:
+        if current and current["speaker"] == w["speaker"]:
+            current["end"] = w["end"]
+            current["text"] += w["text"]
+        else:
+            if current:
+                utterances.append(current)
+            current = {"start": w["start"], "end": w["end"], "speaker": w["speaker"], "text": w["text"]}
+    if current:
+        utterances.append(current)
+
+    utterances.extend(word_segments_no_words)
+    utterances.sort(key=lambda u: u["start"])
+
+    merged: list[dict] = []
+    for u in utterances:
+        u["text"] = u["text"].strip()
+        if not u["text"]:
+            continue
+        if merged and merged[-1]["speaker"] == u["speaker"] and u["start"] - merged[-1]["end"] < 1.5:
+            merged[-1]["end"] = u["end"]
+            merged[-1]["text"] += " " + u["text"]
+        else:
+            merged.append(u)
+    return merged
+
+
+def write_basic_md(path: Path, input_name: str, info: dict, segments: list[dict], model_name: str) -> None:
+    lines = [
+        f"# Транскрипция: {input_name}",
+        "",
+        f"- Модель: `{model_name}`",
+        f"- Язык: {info['language']} (p={info['language_probability']:.2f})",
+        f"- Длительность: {format_ts(info['duration'])} ({info['duration']:.1f}с)",
+        "",
+        "---",
+        "",
+    ]
+    for seg in segments:
+        lines.append(f"**[{format_ts(seg['start'])}]** {seg['text']}")
+        lines.append("")
+    path.write_text("\n".join(lines), encoding="utf-8")
+
+
+def write_plain(path: Path, segments: list[dict]) -> None:
+    path.write_text(" ".join(s["text"] for s in segments), encoding="utf-8")
+
+
+def write_speakers_md(path: Path, input_name: str, info: dict, utterances: list[dict], model_name: str,
+                      diarization_label: str) -> None:
+    speakers_set = sorted({u["speaker"] for u in utterances})
+    lines = [
+        f"# Транскрипция со спикерами: {input_name}",
+        "",
+        f"- Модель: `{model_name}`",
+        f"- Диаризация: `{diarization_label}`",
+        f"- Длительность: {format_ts(info['duration'])} ({info['duration']:.1f}с)",
+        f"- Найдено спикеров: {len(speakers_set)} ({', '.join(speakers_set)})",
+        "",
+        "---",
+        "",
+    ]
+    for u in utterances:
+        lines.append(f"**[{u['speaker']}, {format_ts(u['start'])}]** {u['text']}")
+        lines.append("")
+    path.write_text("\n".join(lines), encoding="utf-8")
+
+
+# =====================================================================
+# ORCHESTRATOR
+# =====================================================================
+
+SHERPA_VENV_PYTHON = Path.home() / ".claude" / "skills" / "transcribe" / "venv-sherpa" / "Scripts" / "python.exe"
+SHERPA_WORKER = Path(__file__).resolve().parent / "diarize_sherpa.py"
+
+# MOSS venv: env MOSS_PYTHON перекрывает default (venv-moss скилла, по аналогии с venv-sherpa).
+MOSS_VENV_PYTHON = os.environ.get("MOSS_PYTHON") or str(
+    Path.home() / ".claude" / "skills" / "transcribe" / "venv-moss" / "Scripts" / "python.exe"
+)
+MOSS_WORKER = Path(__file__).resolve().parent / "diarize_moss.py"
+
+
+def spawn_worker(mode: str, env_extra: dict[str, str], cli: list[str]) -> subprocess.Popen:
+    cmd = [sys.executable, __file__, "--worker", mode] + cli
+    env = os.environ.copy()
+    env["PYTHONUNBUFFERED"] = "1"
+    env["PYTHONIOENCODING"] = "utf-8"
+    env.update(env_extra)
+    return subprocess.Popen(cmd, env=env)
+
+
+def spawn_sherpa_diarize(env_extra: dict[str, str], cli: list[str]) -> subprocess.Popen:
+    """Запустить sherpa-onnx диаризацию из отдельного venv-sherpa."""
+    if not SHERPA_VENV_PYTHON.exists():
+        raise RuntimeError(
+            f"venv-sherpa не найден: {SHERPA_VENV_PYTHON}. "
+            "Установите: python -m venv venv-sherpa && pip install onnxruntime-gpu sherpa-onnx soundfile"
+        )
+    cmd = [str(SHERPA_VENV_PYTHON), str(SHERPA_WORKER)] + cli
+    env = os.environ.copy()
+    env["PYTHONUNBUFFERED"] = "1"
+    env["PYTHONIOENCODING"] = "utf-8"
+    env.update(env_extra)
+    return subprocess.Popen(cmd, env=env)
+
+
+def spawn_moss(env_extra: dict[str, str], cli: list[str]) -> subprocess.Popen:
+    """Запустить MOSS end-to-end (ASR+диаризация) из отдельного venv-moss."""
+    if not Path(MOSS_VENV_PYTHON).exists():
+        raise RuntimeError(
+            f"venv-moss не найден: {MOSS_VENV_PYTHON}. Установите MOSS-Transcribe-Diarize:\n"
+            "  python -m venv venv-moss\n"
+            "  venv-moss\\Scripts\\python -m pip install torch --index-url https://download.pytorch.org/whl/cu128\n"
+            "  git clone https://github.com/OpenMOSS/MOSS-Transcribe-Diarize moss\n"
+            "  venv-moss\\Scripts\\python -m pip install -e ./moss\n"
+            "Либо укажите готовый venv через env MOSS_PYTHON=путь_к_python.exe"
+        )
+    cmd = [MOSS_VENV_PYTHON, str(MOSS_WORKER)] + cli
+    env = os.environ.copy()
+    env["PYTHONUNBUFFERED"] = "1"
+    env["PYTHONIOENCODING"] = "utf-8"
+    env.update(env_extra)
+    return subprocess.Popen(cmd, env=env)
+
+
+def orchestrate(args) -> int:
+    input_path = Path(args.input)
+    if not input_path.exists():
+        print(f"Файл не найден: {input_path}", file=sys.stderr)
+        return 1
+
+    if args.output_dir:
+        output_dir = Path(args.output_dir)
+    else:
+        output_dir = input_path.parent / "Транскрипция" / input_path.stem
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    base = input_path.stem
+    transcribe_json = output_dir / f"{base}.transcribe.json"
+    turns_json = output_dir / f"{base}.turns.json"
+
+    print(f"Файл: {input_path.name}", flush=True)
+    print(f"Каталог: {output_dir}", flush=True)
+
+    # Выбор движка: явный --diarize-engine уважается; иначе с известным N - sherpa-onnx
+    # (быстрее), без N - pyannote community-1 (автодетект числа спикеров; пороговая
+    # кластеризация sherpa пересегментирует: 2026-07-16 дала 242 кластера на ~7 человек).
+    # "moss" - end-to-end (ASR+диаризация одной моделью), заменяет whisper-шаг целиком.
+    engine = args.diarize_engine or ("sherpa-onnx" if args.num_speakers is not None else "pyannote")
+
+    # MOSS полностью заменяет whisper+diarize - отдельный путь до запуска воркеров.
+    # MOSS всегда end-to-end (текст+спикеры вместе), поэтому engine==moss подразумевает
+    # --diarize: иначе --diarize-engine moss без --diarize удивил бы полным разбором со спикерами
+    # (другие движки уважают --diarize; для MOSS он не имеет смысла - модель всегда диаризует).
+    if engine == "moss":
+        if not args.diarize:
+            print("--diarize-engine moss: MOSS end-to-end, диаризация включена автоматически", flush=True)
+            args.diarize = True
+        return orchestrate_moss(args, input_path, output_dir, base)
+
+    transcribe_cli = [
+        "--input", str(input_path),
+        "--out-json", str(transcribe_json),
+        "--model", args.model,
+        "--language", args.language,
+        "--device", args.device,
+        "--compute-type", args.compute_type,
+    ]
+    if args.diarize:
+        transcribe_cli.append("--need-words")
+    if args.glossary:                       # воркер - отдельный процесс, глоссарий ему нужен свой
+        transcribe_cli += ["--glossary", args.glossary]
+    if args.no_glossary:
+        transcribe_cli.append("--no-glossary")
+
+    transcribe_proc = spawn_worker("transcribe", {}, transcribe_cli)
+
+    diarize_proc = None
+    diarization_label = ""
+    if args.diarize:
+        if engine == "sherpa-onnx":
+            sherpa_cli = [
+                "--input", str(input_path),
+                "--out-json", str(turns_json),
+                "--provider", "cuda",
+                "--threshold", str(args.threshold),
+                "--emit-voiceprints", str(output_dir / f"{base}.voiceprints.json"),
+            ]
+            if args.num_speakers is not None:
+                sherpa_cli += ["--num-speakers", str(args.num_speakers)]
+                diarization_label = f"sherpa-onnx eres2net, num_speakers={args.num_speakers}"
+            else:
+                diarization_label = f"sherpa-onnx eres2net, threshold={args.threshold}"
+            print(f"Диаризация: sherpa-onnx (pyannote-segmentation-3.0 + 3D-Speaker)", flush=True)
+            diarize_proc = spawn_sherpa_diarize({}, sherpa_cli)
+        else:
+            diarize_cli = [
+                "--input", str(input_path),
+                "--out-json", str(turns_json),
+                "--model", args.pyannote_model,
+            ]
+            if args.num_speakers is not None:
+                diarize_cli += ["--num-speakers", str(args.num_speakers)]
+            if args.min_speakers is not None:
+                diarize_cli += ["--min-speakers", str(args.min_speakers)]
+            if args.max_speakers is not None:
+                diarize_cli += ["--max-speakers", str(args.max_speakers)]
+            if args.tf32:
+                diarize_cli.append("--tf32")
+            n_label = f"num_speakers={args.num_speakers}" if args.num_speakers is not None else "автодетект N"
+            diarization_label = f"{args.pyannote_model}, {n_label}"
+            print(f"Диаризация: {args.pyannote_model}", flush=True)
+            diarize_proc = spawn_worker("diarize", {}, diarize_cli)
+
+    rc_t = transcribe_proc.wait()
+    if rc_t != 0:
+        if diarize_proc is not None:
+            diarize_proc.terminate()
+        print(f"Транскрипция упала с кодом {rc_t}", file=sys.stderr)
+        return rc_t
+
+    payload = json.loads(transcribe_json.read_text(encoding="utf-8"))
+    segments = payload["segments"]
+    info = payload["info"]
+
+    # Лечение ослышек по глоссарию. Подсказка (hotwords) профилактирует, но не гарантирует:
+    # DAX все равно может выйти как "ДАКС". Правим ДО записи файлов, чтобы дальше по конвейеру
+    # (спикеры, связный лог, саммари) шел уже верный текст.
+    gl = _glossary(args)
+    if gl:
+        stats = gl.fix_segments(segments)
+        if stats:
+            print("  Термины: " + ", ".join(f"{k} x{v}" for k, v in sorted(stats.items())), flush=True)
+
+    transcript_md = output_dir / f"{base} - транскрипция.md"
+    plain_txt = output_dir / f"{base} - транскрипция.txt"
+    write_basic_md(transcript_md, input_path.name, info, segments, args.model)
+    write_plain(plain_txt, segments)
+    print(f"  MD:    {transcript_md}", flush=True)
+    print(f"  Plain: {plain_txt}", flush=True)
+
+    if diarize_proc is not None:
+        rc_d = diarize_proc.wait()
+        if rc_d != 0:
+            print(f"Диаризация упала с кодом {rc_d} (транскрипция сохранена)", file=sys.stderr)
+            return rc_d
+        turns = json.loads(turns_json.read_text(encoding="utf-8"))
+        utterances = merge_with_speakers(segments, turns)
+        # Реплики со спикерами собираются заново ИЗ СЛОВ, а не из текста сегментов, поэтому правку
+        # глоссария нужно повторить: иначе файл со спикерами (именно он идет дальше в разбор)
+        # остался бы с ослышками, хотя обычная транскрипция уже вылечена.
+        if gl:
+            gl.fix_segments(utterances)
+        speakers_md = output_dir / f"{base} - со спикерами.md"
+        write_speakers_md(speakers_md, input_path.name, info, utterances, args.model, diarization_label)
+        print(f"  Spk:   {speakers_md}", flush=True)
+
+        if engine != "sherpa-onnx":
+            # Отпечатки голоса для голосовой базы живут в eres2net-пространстве -
+            # считаем их sherpa-воркером по готовым turns (сама диаризация не повторяется).
+            # Старый файл удаляем ДО пересчета: при провале этапа протухшие отпечатки
+            # (метки прошлого прогона) не должны достаться analyze_video_local по exists().
+            voiceprints_json = output_dir / f"{base}.voiceprints.json"
+            try:
+                if voiceprints_json.exists():
+                    voiceprints_json.unlink()
+            except OSError as e:
+                print(f"Не удалился старый {voiceprints_json.name}: {e}", file=sys.stderr)
+            prints_cli = [
+                "--input", str(input_path),
+                "--from-turns", str(turns_json),
+                "--emit-voiceprints", str(voiceprints_json),
+                "--provider", "cuda",
+            ]
+            try:
+                rc_p = spawn_sherpa_diarize({}, prints_cli).wait()
+                if rc_p != 0:
+                    print(f"Отпечатки голоса не посчитаны (код {rc_p}), пайплайн продолжен", file=sys.stderr)
+            except Exception as e:
+                print(f"Отпечатки голоса не посчитаны: {e}", file=sys.stderr)
+
+    if not args.keep_intermediate:
+        for f in (transcribe_json, turns_json):
+            try:
+                if f.exists():
+                    f.unlink()
+            except OSError:
+                pass
+
+    return 0
+
+
+def orchestrate_moss(args, input_path: Path, output_dir: Path, base: str) -> int:
+    """Путь MOSS: end-to-end ASR+диаризация одной моделью (без whisper-шага).
+
+    MOSS сам дает текст + спикер-сегменты + таймстампы, поэтому whisper и отдельный
+    diarize-воркер не запускаются. Переиспользуются write_basic_md/write_speakers_md
+    (тот же выходной формат, что у whisper+sherpa). Отпечатки голоса для голосовой
+    базы считаются sherpa eres2net по turns из MOSS (диаризация не повторяется).
+    """
+    moss_json = output_dir / f"{base}.moss.json"
+    moss_cli = [
+        "--input", str(input_path),
+        "--out-json", str(moss_json),
+        "--provider", "cuda" if args.device == "cuda" else "cpu",
+        "--language", args.language,
+    ]
+    print("ASR+диаризация: MOSS-Transcribe-Diarize (end-to-end, без whisper)", flush=True)
+    try:
+        moss_proc = spawn_moss({}, moss_cli)
+    except RuntimeError as e:
+        print(str(e), file=sys.stderr)
+        return 2
+
+    rc_m = moss_proc.wait()
+    if rc_m != 0:
+        print(f"MOSS упал с кодом {rc_m}", file=sys.stderr)
+        return rc_m
+
+    payload = json.loads(moss_json.read_text(encoding="utf-8"))
+    utterances = payload["utterances"]
+    info = {
+        "duration": payload["duration"],
+        "language": payload.get("language", "ru"),
+        "language_probability": 1.0,
+    }
+    model_label = payload.get("model", "MOSS-Transcribe-Diarize")
+    diarization_label = f"MOSS end-to-end (RTF {payload.get('rtf', 0):.3f})"
+
+    # Лечение ослышек по глоссарию - до формирования обоих файлов. У MOSS реплики уже готовы,
+    # поэтому правки хватает одной (в отличие от пути whisper+диаризация, где текст со спикерами
+    # пересобирается из слов).
+    gl = _glossary(args)
+    if gl:
+        stats = gl.fix_segments(utterances)
+        if stats:
+            print("  Термины: " + ", ".join(f"{k} x{v}" for k, v in sorted(stats.items())), flush=True)
+
+    # Транскрипция без спикеров (тот же формат, что из whisper)
+    segments = [{"start": u["start"], "end": u["end"], "text": u["text"]} for u in utterances]
+    transcript_md = output_dir / f"{base} - транскрипция.md"
+    plain_txt = output_dir / f"{base} - транскрипция.txt"
+    write_basic_md(transcript_md, input_path.name, info, segments, model_label)
+    write_plain(plain_txt, segments)
+    print(f"  MD:    {transcript_md}", flush=True)
+    print(f"  Plain: {plain_txt}", flush=True)
+
+    # Со спикерами
+    speakers_md = output_dir / f"{base} - со спикерами.md"
+    write_speakers_md(speakers_md, input_path.name, info, utterances, model_label, diarization_label)
+    print(f"  Spk:   {speakers_md}", flush=True)
+
+    # Отпечатки голоса (eres2net-пространство) по turns из utterances через sherpa-воркер.
+    voiceprints_json = output_dir / f"{base}.voiceprints.json"
+    turns_json = output_dir / f"{base}.turns.json"
+    turns = [{"start": u["start"], "end": u["end"], "speaker": u["speaker"]} for u in utterances]
+    turns_json.write_text(json.dumps(turns, ensure_ascii=False), encoding="utf-8")
+    try:
+        if voiceprints_json.exists():
+            voiceprints_json.unlink()
+    except OSError as e:
+        print(f"Не удалился старый {voiceprints_json.name}: {e}", file=sys.stderr)
+    prints_cli = [
+        "--input", str(input_path),
+        "--from-turns", str(turns_json),
+        "--emit-voiceprints", str(voiceprints_json),
+        "--provider", "cuda",
+    ]
+    try:
+        rc_p = spawn_sherpa_diarize({}, prints_cli).wait()
+        if rc_p != 0:
+            print(f"Отпечатки голоса не посчитаны (код {rc_p}), пайплайн продолжен", file=sys.stderr)
+    except Exception as e:
+        print(f"Отпечатки голоса не посчитаны: {e}", file=sys.stderr)
+
+    if not args.keep_intermediate:
+        for f in (moss_json, turns_json):
+            try:
+                if f.exists():
+                    f.unlink()
+            except OSError:
+                pass
+
+    return 0
+
+
+# =====================================================================
+# MAIN: разбор аргументов
+# =====================================================================
+
+def main() -> int:
+    if len(sys.argv) >= 3 and sys.argv[1] == "--worker":
+        mode = sys.argv[2]
+        worker_args = sys.argv[3:]
+        ap = argparse.ArgumentParser()
+        if mode == "transcribe":
+            ap.add_argument("--input", required=True)
+            ap.add_argument("--out-json", required=True)
+            ap.add_argument("--model", default="mobiuslabsgmbh/faster-whisper-large-v3-turbo")
+            ap.add_argument("--language", default="ru")
+            ap.add_argument("--device", default="cuda")
+            ap.add_argument("--compute-type", default="float16")
+            ap.add_argument("--need-words", action="store_true")
+            ap.add_argument("--glossary", default=None)
+            ap.add_argument("--no-glossary", action="store_true")
+            return worker_transcribe(ap.parse_args(worker_args))
+        elif mode == "diarize":
+            ap.add_argument("--input", required=True)
+            ap.add_argument("--out-json", required=True)
+            ap.add_argument("--model", default="pyannote/speaker-diarization-community-1")
+            ap.add_argument("--num-speakers", type=int, default=None)
+            ap.add_argument("--min-speakers", type=int, default=None)
+            ap.add_argument("--max-speakers", type=int, default=None)
+            ap.add_argument("--tf32", action="store_true")
+            return worker_diarize(ap.parse_args(worker_args))
+        else:
+            print(f"Неизвестный worker mode: {mode}", file=sys.stderr)
+            return 1
+
+    ap = argparse.ArgumentParser(description="Локальная транскрипция через faster-whisper + опц. диаризация (parallel)")
+    ap.add_argument("input", help="Путь к аудио/видео файлу")
+    ap.add_argument("--output-dir", default=None, help="Каталог вывода")
+    ap.add_argument("--model", default="mobiuslabsgmbh/faster-whisper-large-v3-turbo")
+    ap.add_argument("--language", default="ru")
+    ap.add_argument("--device", default="cuda", choices=["cuda", "cpu"])
+    ap.add_argument("--compute-type", default="float16")
+    ap.add_argument("--diarize", action="store_true", help="Включить диаризацию (параллельно с транскрипцией)")
+    ap.add_argument("--diarize-engine", default=None, choices=["sherpa-onnx", "pyannote", "moss"],
+                    help="Движок. Default: с --num-speakers - sherpa-onnx (быстрее), без - pyannote "
+                         "community-1 (автодетект N; пороговый автодетект sherpa пересегментирует). "
+                         "moss - MOSS-Transcribe-Diarize end-to-end (ASR+диаризация одной моделью, "
+                         "лучше текст на терминах, но ~2x медленнее; требует venv-moss).")
+    ap.add_argument("--pyannote-model", default="pyannote/speaker-diarization-community-1",
+                    help="Чекпойнт pyannote для движка pyannote")
+    ap.add_argument("--num-speakers", type=int, default=None)
+    ap.add_argument("--min-speakers", type=int, default=None, help="Только для pyannote")
+    ap.add_argument("--max-speakers", type=int, default=None, help="Только для pyannote")
+    ap.add_argument("--threshold", type=float, default=0.5,
+                    help="Порог кластеризации для sherpa-onnx (default 0.5)")
+    ap.add_argument("--no-tf32", dest="tf32", action="store_false", help="Отключить TF32 для pyannote (по умолчанию вкл)")
+    ap.set_defaults(tf32=True)
+    ap.add_argument("--keep-intermediate", action="store_true", help="Не удалять промежуточные JSON")
+    ap.add_argument("--glossary", default=None,
+                    help="Файл глоссария терминов (по умолчанию glossary.txt в корне скила, "
+                         "перекрывается env TRANSCRIBE_GLOSSARY). Правильные написания уходят "
+                         "подсказкой распознавателю, ослышки правятся в готовом тексте")
+    ap.add_argument("--no-glossary", action="store_true", help="Не использовать глоссарий терминов")
+    args = ap.parse_args()
+    return orchestrate(args)
+
+
+if __name__ == "__main__":
+    try:
+        rc = main()
+    except SystemExit:
+        raise
+    except BaseException:
+        log_path = Path.home() / ".claude" / "skills" / "transcribe" / "transcribe_local.crash.log"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with log_path.open("a", encoding="utf-8") as f:
+            f.write("=" * 80 + "\n")
+            f.write(f"argv: {sys.argv}\n")
+            f.write(traceback.format_exc())
+            f.write("\n")
+        print(f"\nКраш записан в {log_path}", file=sys.stderr)
+        traceback.print_exc()
+        rc = 2
+    sys.exit(rc)
