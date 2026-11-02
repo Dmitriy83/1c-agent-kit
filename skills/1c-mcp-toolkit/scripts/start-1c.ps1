@@ -30,7 +30,8 @@
     Имя пользователя для автологина.
 
 .PARAMETER Password
-    Пароль для автологина.
+    Пароль для автологина. Для пользователя без пароля не указывать (или пустая строка):
+    тогда /P не передается.
 
 .PARAMETER EpfPath
     Путь к MCP_Toolkit.epf. По умолчанию - bin/MCP_Toolkit.epf рядом со скриптом.
@@ -96,8 +97,8 @@ param(
     [Parameter(Mandatory = $true)]
     [string]$User,
 
-    [Parameter(Mandatory = $true)]
-    [string]$Password,
+    [AllowEmptyString()]
+    [string]$Password = '',
 
     [string]$EpfPath = (Join-Path $PSScriptRoot "..\bin\MCP_Toolkit.epf"),
 
@@ -133,10 +134,10 @@ if (-not (Test-Path -LiteralPath $Database)) {
 # 2. Готовим аргументы запуска (+ autostart-файлы при -AutoStart)
 $arguments = @(
     "/F`"$Database`"",
-    "/N`"$User`"",
-    "/P`"$Password`"",
-    "/Execute`"$epfFullPath`""
+    "/N`"$User`""
 )
+if ($Password) { $arguments += "/P`"$Password`"" }
+$arguments += "/Execute`"$epfFullPath`""
 
 $signalPath = $null
 if ($AutoStart) {
