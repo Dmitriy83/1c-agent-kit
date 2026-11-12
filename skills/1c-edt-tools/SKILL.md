@@ -512,3 +512,17 @@ AI-EDT facade toolset has the same limitations; inspect the actual tool catalog.
   `DataCompositionSelectedField`, and `SelectedItemGroup` maps to
   `DataCompositionSelectedFieldGroup`. Check platform documentation before using
   XML type names in `Type(...)` calls.
+- In an adopted Role, reference RLS templates already declared by the base role;
+  do not copy them into the extension with the same names. EDT validation may
+  pass, but platform update fails with `RestrictionTemplates ... already exists`.
+- When adding an owned predefined item to an adopted Catalog, preserve the base
+  values and enable control of its predefined-data shape properties. A confirmed
+  working set for a hierarchical catalog is `hierarchical`, `hierarchyType`,
+  `codeLength`, `codeAllowedLength`, `descriptionLength`, and `codeType` marked
+  `Checked`, with `predefined` marked `Extended`. Not every property is required
+  for every catalog. Missing control can pass EDT validation yet fail at platform
+  update with `cannot disable controllability of this property` (no property name).
+- After a failed pre-launch update, `run_yaxunit_tests` may keep returning Pending
+  even though no runtime client is running and no JUnit report exists. Verify the
+  application is UPDATED and check `list_configurations`; do not count Pending as
+  an executed test. A new explicit test filter starts a separate run in this case.
