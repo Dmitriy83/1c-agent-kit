@@ -487,3 +487,28 @@ ID приложения, имя, тип, состояние обновления
 ### Изучение API платформы
 1. `get_platform_documentation` с `typeName` — документация по типу
 2. `get_content_assist` — автодополнение в контексте кода
+
+### Report restoration with the standalone EDT MCP tools (2026-11-12)
+
+These limitations apply to the standalone `create_metadata` / `modify_metadata` /
+`adopt_metadata_object` toolset observed on EDT 2026.1.2.2. Do not assume that the
+AI-EDT facade toolset has the same limitations; inspect the actual tool catalog.
+
+- `get_metadata_details(assignable=true)` lists `uuid` as STRING, but setting it
+  through `modify_metadata` fails with a Java String / UUID type mismatch. When
+  restoring a historical object, preserve its UUID and produced type IDs from Git
+  using a targeted metadata restore, then refresh and revalidate the object.
+- `modify_metadata` rejects `mainDataCompositionSchema` references to a Template
+  member even though it lists the property as assignable. Creating the Template
+  is not enough: verify the report has the template reference after restoration.
+- `list_subsystems` can return a valid nested FQN that `adopt_metadata_object`
+  cannot resolve, for example `Subsystem.Parent.Subsystem.Child`. Confirm the
+  FQN through the inventory before using the targeted file fallback. Register
+  the child in its parent and verify recursive `get_subsystem_content` afterward.
+- Changing `templateType` to `DataCompositionSchema` does not create schema
+  content. If the connected catalog has no DCS editing tool, restore or edit the
+  `.dcs` explicitly, validate its query and XML, then revalidate the report.
+- DCS XML type names are not BSL runtime type names: `SelectedItemField` maps to
+  `DataCompositionSelectedField`, and `SelectedItemGroup` maps to
+  `DataCompositionSelectedFieldGroup`. Check platform documentation before using
+  XML type names in `Type(...)` calls.
