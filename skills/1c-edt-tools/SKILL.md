@@ -526,3 +526,28 @@ AI-EDT facade toolset has the same limitations; inspect the actual tool catalog.
   even though no runtime client is running and no JUnit report exists. Verify the
   application is UPDATED and check `list_configurations`; do not count Pending as
   an executed test. A new explicit test filter starts a separate run in this case.
+
+### Role and configuration serialization failures (standalone MCP 2.6.1, 2026-11-15)
+
+Observed with EDT 2026.1.2.2 and platform 8.3.27. Check the EDT platform model
+before changing rights: `resources/v8.3.27/rightInfos/rightInfos.xml` inside
+`com._1c.g5.v8.dt.platform_v8.3.27_*.jar`. Supported rights depend on metadata
+type. In particular, an InformationRegister has Update/Edit rights,
+but no Insert right. Existing invalid Insert entries can make even an unrelated
+`modify_metadata` role change fail in `RightCollectionRuntimeOrderSorterDelegate`
+with `Cannot read field "value" because "anotherInteger" is null`. After a
+confirmed failure, remove only invalid rights through a targeted file fallback,
+revalidate the role, and retry the supported MCP operation. Do not remove valid
+Insert rights of documents or catalogs.
+
+A scan of unique UUID definitions does not detect duplicate membership in
+`Configuration.mdo`. Repeating the same StyleItem reference can produce both
+`UUID is not unique` and `Expected StyleItem, actual Properties` during platform
+load. Check duplicate configuration references and exported XML root types;
+remove only the duplicate reference and preserve the object's UUID.
+
+An adopted form item's static `commandName` may refer to a CommonCommand
+absent from the extension configuration. Platform load then reports an invalid form command
+name. Verify the base command and adopt it through `adopt_metadata_object`;
+check both Configuration membership and the command's exported XML. Successful
+EDT validation or XML export alone does not prove that platform load succeeds.
