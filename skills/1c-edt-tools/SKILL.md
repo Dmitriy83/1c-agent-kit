@@ -551,3 +551,15 @@ absent from the extension configuration. Platform load then reports an invalid f
 name. Verify the base command and adopt it through `adopt_metadata_object`;
 check both Configuration membership and the command's exported XML. Successful
 EDT validation or XML export alone does not prove that platform load succeeds.
+
+### Query checks in extension projects (standalone MCP 2.6.1, 2026-11-15)
+
+`validate_query` in an extension can report a missing base attribute when the
+attribute was not adopted into that extension. Verify the attribute in the base
+metadata. If the query uses only base objects and fields, also validate it in
+the base project; do not dismiss errors for extension-owned fields this way.
+
+A standard-attribute entry in a catalog's `.mdo` is not proof that the field is
+available to a runtime query. For example, `IsFolder` is unavailable when the
+catalog is not hierarchical. Check the catalog properties and runtime errors,
+not just the presence of a standard-attribute declaration.
