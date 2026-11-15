@@ -102,3 +102,12 @@ python skills/1c-vanessa-steps/scripts/validate.py "путь/к/сценарию
 [va-ai](https://github.com/Nikolay-Shirokov/va-ai) (MIT, (c) Nikolay Shirokov) и адаптированы под
 раскладку этого набора. Сам Vanessa Automation - отдельный проект, см.
 [vanessa-automation](https://github.com/Pr-mex/vanessa-automation).
+
+## Validator coverage check (2026-11-15)
+
+Always inspect the reported scenario and step counts. The bundled `validate.py`
+parsed zero steps in an English feature. A Russian Scenario Outline was also
+parsed as zero steps and incorrectly returned success. Zero parsed steps is not a successful check of
+that scenario. Validate unsupported forms against the actual Vanessa step
+catalog and execute them, or expand a temporary outline into plain scenarios.
+Do not change the project's feature language just to obtain a green validator.

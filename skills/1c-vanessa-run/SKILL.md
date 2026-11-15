@@ -189,3 +189,24 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File skills/1c-vanessa-run/sc
 вызывает настоящий exe. Источник истины - модуль видео в распакованной epf VA (поиск по тексту ошибки).
 Окно ошибки оставляет висеть менеджер (поэтому `-KeepProcesses`): попроси пользователя закрыть его до
 следующей записи, иначе он попадет в кадр.
+
+## Standalone 1.2.043.28 runtime checks (2026-11-15)
+
+The English translation of the built-in server-code step can fail while loading
+an otherwise valid feature with a parameter-count mismatch (0 to 1). This is a
+Vanessa localization failure, before application code executes. A temporary
+server diagnostic helper in native Russian, with the generator language also
+set to `ru`, was verified to run; keep the project's normal language for UI
+scenarios. Check the actual JUnit cases and log, not just the process exit.
+
+Do not assume Scenario Outline placeholders are expanded inside a multiline
+BSL block. In the observed run, `<CaseIndex>` reached Execute unchanged and
+caused a compilation error. Inspect the executed fragment; explicit scenarios
+with literal fixture values avoid this dependency.
+
+An empty report cell is not a universal report-success assertion. A report with
+no source rows may produce an empty spreadsheet. Wait for the application's
+actual completion/error state and assert nonempty cells only with known test
+data. For standard 1C report forms, the tested spreadsheet field exposes
+`GetStatePresentation()`; the meaning of `Visible` must be verified in the
+specific form's generation and error handlers.
