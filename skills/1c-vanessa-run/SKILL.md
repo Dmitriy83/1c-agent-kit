@@ -192,12 +192,24 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File skills/1c-vanessa-run/sc
 
 ## Standalone 1.2.043.28 runtime checks (2026-11-15)
 
-The English translation of the built-in server-code step can fail while loading
-an otherwise valid feature with a parameter-count mismatch (0 to 1). This is a
-Vanessa localization failure, before application code executes. A temporary
-server diagnostic helper in native Russian, with the generator language also
-set to `ru`, was verified to run; keep the project's normal language for UI
-scenarios. Check the actual JUnit cases and log, not just the process exit.
+The English translation of the built-in `at server no context` step can fail
+while loading an otherwise valid feature with a parameter-count mismatch (0 to 1).
+This is a Vanessa localization failure, before application code executes.
+A follow-up run on 2026-11-16 verified the standard English alternative:
+`And I execute 1C:Enterprise script at server` with a Gherkin table, for example:
+
+```gherkin
+And I execute 1C:Enterprise script at server
+    | 'TestData = New ValueTable;' |
+    | 'If TestData.Count() <> 0 Then Raise "Unexpected row count"; EndIf;' |
+```
+
+This variant also supports exported scenario parameters such as `[CaseName]`
+inside table cells. It runs in the TestManager infobase and uses the Vanessa
+form context, so avoid its reserved form variable names. It requires no
+VAExtension. Prefer this checked English variant when the project uses English.
+A temporary native Russian helper with generator language `ru` also worked.
+Check actual JUnit cases and logs, not just the process exit.
 
 Do not assume Scenario Outline placeholders are expanded inside a multiline
 BSL block. In the observed run, `<CaseIndex>` reached Execute unchanged and
